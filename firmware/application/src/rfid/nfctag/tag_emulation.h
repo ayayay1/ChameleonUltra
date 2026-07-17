@@ -13,6 +13,10 @@
 #define TAG_MAX_SLOT_NUM 8
 
 extern bool g_is_tag_emulating;
+// Sense (HF/LF) of the field that most recently woke the device. Set by
+// tag_emulation_smart_poll_on_field() from the field-detect ISR and used to
+// keep auto-poll rotation within the same frequency band as the reader.
+extern tag_sense_type_t g_active_sense;
 
 // Tag data buffer
 typedef struct {
@@ -45,9 +49,22 @@ typedef struct {
  * This configuration can be preserved by persistently to Flash
  * 4 bytes a word, keep in mind the entire word alignment
  */
-#define TAG_SLOT_CONFIG_CURRENT_VERSION 8
+#define TAG_SLOT_CONFIG_CURRENT_VERSION 11
 // Intended struct size, for static assert
-#define TAG_SLOT_CONFIG_CURRENT_SIZE 68
+#define TAG_SLOT_CONFIG_CURRENT_SIZE 72
+
+/* Auto-poll feature flags (bitmask stored in slotConfig.auto_poll_enable) */
+#define AUTO_POLL_SMART_SELECT  (1u << 0)  // pick slot by detected field type + last_auth
+#define AUTO_POLL_TIMER_ROTATE  (1u << 1)  // rotate active slot among enabled slots on a timer
+/* Convenience mask: full auto-poll = wake-on-field + idle multi-slot rotation */
+#define AUTO_POLL_ALL           (AUTO_POLL_SMART_SELECT | AUTO_POLL_TIMER_ROTATE)
+
+/* Default rotation interval (ms) used when migrating / resetting config.
+ * Matches the validated ZhaiRen "POLL1000ms" reference build. */
+#define AUTO_POLL_INTERVAL_DEFAULT_MS 350
+/* Clamp range for the rotation interval to keep the app_timer sane */
+#define AUTO_POLL_INTERVAL_MIN_MS     200
+#define AUTO_POLL_INTERVAL_MAX_MS     60000
 
 typedef struct {
     // Basic configuration
@@ -69,6 +86,10 @@ typedef struct {
             tag_specific_type_t tag_lf;
         };
     } slots[TAG_MAX_SLOT_NUM];
+    // v9 additions: global auto-poll (Smart poll + multi-slot auto polling) settings
+    uint8_t  auto_poll_enable;       // bitmask of AUTO_POLL_* flags
+    uint8_t  last_auth_slot;         // last slot a reader engaged (Smart poll preference)
+    uint16_t auto_poll_interval_ms;  // rotation interval for AUTO_POLL_TIMER_ROTATE
 } PACKED tag_slot_config_t;
 
 // Use the macro to check the struct size
@@ -117,5 +138,31 @@ void tag_emulation_factory_init(void);
 uint8_t tag_emulation_slot_find_next(uint8_t slot_now);
 uint8_t tag_emulation_slot_find_prev(uint8_t slot_now);
 bool is_tag_specific_type_valid(tag_specific_type_t tag_type);
+
+/* ---- Auto-poll (Smart poll + multi-slot auto polling) ---- */
+// Returns the current auto_poll enable bitmask (AUTO_POLL_* flags)
+uint8_t tag_emulation_get_auto_poll_enable(void);
+// Set enable bitmask + rotation interval (interval is clamped). Persists to flash.
+void tag_emulation_set_auto_poll(uint8_t enable, uint16_t interval_ms);
+// Read the full auto-poll config (enable / interval / last_auth_slot)
+void tag_emulation_get_auto_poll(uint8_t *enable, uint16_t *interval_ms, uint8_t *last_auth_slot);
+// Called from the HF/LF field-detect interrupt. Selects the best slot for the
+// given sense type (Smart poll) and records it as last_auth. ISR-safe: performs
+// a Flash-free slot switch and defers persistence. No-op unless enabled.
+void tag_emulation_smart_poll_on_field(tag_sense_type_t sense);
+// Called from the main loop to persist Smart-poll state (last_auth_slot) to
+// Flash. Must NOT be called from interrupt context.
+void tag_emulation_smart_poll_process(void);
+// Called by the auto-poll timer. Rotates the active slot among enabled slots
+// (multi-slot auto polling). No-op unless enabled / in tag mode / cycling.
+void tag_emulation_auto_poll_rotate(void);
+// Called when the user picks a slot with A/B (key-wakeup). Marks manual mode so
+// a following reader field emulates the chosen slot WITHOUT entering the
+// auto-poll cycle. Also cancels any running cycle.
+void tag_emulation_user_select_slot(void);
+// Called from the HF/LF FIELD_LOST handler. Clears manual mode so the next
+// passive RF wake can auto-cycle again. The auto-poll cycle itself is left
+// running (time-guarded) so a field blip does not kill it.
+void tag_emulation_on_field_lost(void);
 
 #endif

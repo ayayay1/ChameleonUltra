@@ -1,10 +1,12 @@
 #include "tag_emulation.h"
 
+#include "app_timer.h"
 #include "crc_utils.h"
 #include "fds_ids.h"
 #include "fds_util.h"
 #include "lf_tag_em.h"
 #include "nfc_14a.h"
+#include "rfid_main.h"
 #include "nfc_mf0_ntag.h"
 #include "nfc_mf1.h"
 #include "nfc_14a_4.h"
@@ -29,6 +31,33 @@ NRF_LOG_MODULE_REGISTER();
 
 // Is the logo in the analog card?
 bool g_is_tag_emulating = false;
+// Sense of the field currently waking the device; see tag_emulation.h.
+tag_sense_type_t g_active_sense = TAG_SENSE_HF;
+
+// Smart-poll deferred persistence flag. Set inside the field-detect ISR,
+// cleared by tag_emulation_smart_poll_process() running in the main loop so
+// that no FDS/Flash write ever happens from interrupt context.
+static volatile bool g_smart_poll_dirty = false;
+
+// ---------------------------------------------------------------------------
+// Auto-poll cycle session.
+// When a reader field *passively* wakes the device with TIMER_ROTATE enabled we
+// enter a rotation cycle that keeps advancing through the enabled slots
+// (1,2,3,4,...) at the configured interval, protected by a time guard. The guard
+// is refreshed on every field (re-)assert, so a field blip / re-detect does NOT
+// reset us back to the first slot — the reader sees the cards in turn. The cycle
+// ends only when the guard expires (no field for AUTO_POLL_CYCLE_GUARD_MS).
+// ---------------------------------------------------------------------------
+static bool     g_ap_cycling = false;
+static uint32_t g_ap_cycle_end_ticks = 0;
+#ifndef AUTO_POLL_CYCLE_GUARD_MS
+#define AUTO_POLL_CYCLE_GUARD_MS 5000   // keep cycling this long after the last field
+#endif
+
+// Manual (key-wakeup) slot selection. When set, a following reader field
+// emulates the button-chosen slot and never enters the auto-poll cycle.
+// Cleared on FIELD_LOST so the next passive wake can auto-cycle again.
+static bool g_manual_slot_select = false;
 
 static tag_specific_type_t tag_specific_type_old2new_lf_values[][2] = {TAG_SPECIFIC_TYPE_OLD2NEW_LF_VALUES};
 static tag_specific_type_t tag_specific_type_old2new_hf_values[][2] = {TAG_SPECIFIC_TYPE_OLD2NEW_HF_VALUES};
@@ -77,6 +106,11 @@ static tag_slot_config_t slotConfig ALIGN_U32 = {
         { .enabled_hf = false, .enabled_lf = false, .tag_hf = TAG_TYPE_UNDEFINED,   .tag_lf = TAG_TYPE_UNDEFINED, },  // 7
         { .enabled_hf = false, .enabled_lf = false, .tag_hf = TAG_TYPE_UNDEFINED,   .tag_lf = TAG_TYPE_UNDEFINED, },  // 8
     },
+    // v9 additions: auto-poll. v10 default = full auto-poll (wake-on-field +
+    // idle multi-slot rotation) so the feature works out of the box.
+    .auto_poll_enable = AUTO_POLL_ALL,
+    .last_auth_slot = 0,
+    .auto_poll_interval_ms = AUTO_POLL_INTERVAL_DEFAULT_MS,
 };
 // The card slot configuration unique CRC, once the slot configuration changes, can be checked by CRC
 static uint16_t m_slot_config_crc;
@@ -444,7 +478,7 @@ static void tag_emulation_migrate_slot_config_v0_to_v8(void) {
     NRF_LOG_INFO("Migrating slotConfig v0...");
     NRF_LOG_HEXDUMP_INFO(tmpbuf, sizeof(tmpbuf));
     // Populate new slotConfig struct
-    slotConfig.version = TAG_SLOT_CONFIG_CURRENT_VERSION;
+    slotConfig.version = 8;  // v0->v8; the v8->v9 step runs in the cascade below
     slotConfig.active_slot = tmpbuf[0];
     for (uint8_t i = 0; i < ARRAYLEN(slotConfig.slots); i++) {
         bool enabled = tmpbuf[4 + (i * 4)] & 1;
@@ -469,6 +503,37 @@ static void tag_emulation_migrate_slot_config_v0_to_v8(void) {
     }
 }
 
+static void tag_emulation_migrate_slot_config_v8_to_v9(void) {
+    // v8 (official v2.2.0) had no auto-poll fields; initialise them.
+    NRF_LOG_INFO("Migrating slotConfig v8 -> v9 (auto-poll)...");
+    slotConfig.version = 9;
+    slotConfig.auto_poll_enable = 0;
+    slotConfig.last_auth_slot = 0;
+    slotConfig.auto_poll_interval_ms = AUTO_POLL_INTERVAL_DEFAULT_MS;
+}
+
+static void tag_emulation_migrate_slot_config_v9_to_v10(void) {
+    // v10: auto-poll unified. Earlier v9 shipped with auto_poll_enable=0, which
+    // meant users who only enabled Smart-select (wake) saw no multi-slot
+    // rotation ("wake works, poll doesn't"). v10 turns ON the full feature by
+    // default (wake-on-field + idle rotation) and standardises the rotation
+    // interval on the validated 1000 ms cadence so it works with no extra CLI.
+    NRF_LOG_INFO("Migrating slotConfig v9 -> v10 (auto-poll unified, default-on)...");
+    slotConfig.version = 10;
+    slotConfig.auto_poll_enable = AUTO_POLL_ALL;
+    slotConfig.auto_poll_interval_ms = AUTO_POLL_INTERVAL_DEFAULT_MS;
+}
+
+static void tag_emulation_migrate_slot_config_v10_to_v11(void) {
+    // v11: re-apply auto-poll defaults so devices that already ran the v9->v10
+    // migration (which used the older 1000 ms cadence) pick up the new 350 ms
+    // default interval on the next boot without a factory reset.
+    NRF_LOG_INFO("Migrating slotConfig v10 -> v11 (auto-poll 350ms default)...");
+    slotConfig.version = 11;
+    slotConfig.auto_poll_enable = AUTO_POLL_ALL;
+    slotConfig.auto_poll_interval_ms = AUTO_POLL_INTERVAL_DEFAULT_MS;
+}
+
 static void tag_emulation_migrate_slot_config(void) {
     switch (slotConfig.version) {
         case 0:
@@ -487,6 +552,15 @@ static void tag_emulation_migrate_slot_config(void) {
              * through to the next case.
              */
 
+            tag_emulation_save_config();
+        case 8:
+            tag_emulation_migrate_slot_config_v8_to_v9();
+            // fall through: intermediate step, save only on the last one
+        case 9:
+            tag_emulation_migrate_slot_config_v9_to_v10();
+            // fall through
+        case 10:
+            tag_emulation_migrate_slot_config_v10_to_v11();
             tag_emulation_save_config();
         case TAG_SLOT_CONFIG_CURRENT_VERSION:
             break;
@@ -634,7 +708,9 @@ uint8_t tag_emulation_slot_find_next(uint8_t slot_now) {
     uint8_t start_slot = (slot_now + 1 == TAG_MAX_SLOT_NUM) ? 0 : slot_now + 1;
     for (uint8_t i = start_slot;;) {
         if (i == slot_now) return slot_now;                                              // No other activated card slots were found after a loop
-        if (slotConfig.slots[i].enabled_hf || slotConfig.slots[i].enabled_lf) return i;  // Check whether the card slot that is currently traversed is enabled, so that the capacity determines that the current card slot is the card slot that can effectively enable capacity
+        // Only consider slots enabled for the SENSE of the field that woke us,
+        // so an HF reader polls only HF card slots and an LF reader only LF ones.
+        if (is_slot_enabled(i, g_active_sense)) return i;
         i++;
         if (i == TAG_MAX_SLOT_NUM) {  // Continue the next cycle
             i = 0;
@@ -683,6 +759,202 @@ void tag_emulation_change_type(uint8_t slot, tag_specific_type_t tag_type) {
     if (sense_type != TAG_SENSE_NO) {
         load_data_by_tag_type(slot, tag_type);
         NRF_LOG_INFO("reload data success.");
+    }
+}
+
+/* =========================================================================
+ * Auto-poll (Smart poll + multi-slot auto polling)
+ * ========================================================================= */
+
+uint8_t tag_emulation_get_auto_poll_enable(void) {
+    return slotConfig.auto_poll_enable;
+}
+
+void tag_emulation_get_auto_poll(uint8_t *enable, uint16_t *interval_ms, uint8_t *last_auth_slot) {
+    if (enable != NULL)        *enable = slotConfig.auto_poll_enable;
+    if (interval_ms != NULL)   *interval_ms = slotConfig.auto_poll_interval_ms;
+    if (last_auth_slot != NULL) *last_auth_slot = slotConfig.last_auth_slot;
+}
+
+void tag_emulation_set_auto_poll(uint8_t enable, uint16_t interval_ms) {
+    slotConfig.auto_poll_enable = enable & (AUTO_POLL_SMART_SELECT | AUTO_POLL_TIMER_ROTATE);
+    // Enabling multi-slot rotation explicitly exits manual (key-selected) mode:
+    // the user wants cyclic polling again, so drop any sticky manual override
+    // and let the next passive RF wake start a fresh cycle from the best slot.
+    if (slotConfig.auto_poll_enable & AUTO_POLL_TIMER_ROTATE) {
+        g_manual_slot_select = false;
+        g_ap_cycling = false;
+    }
+    if (interval_ms < AUTO_POLL_INTERVAL_MIN_MS) interval_ms = AUTO_POLL_INTERVAL_MIN_MS;
+    if (interval_ms > AUTO_POLL_INTERVAL_MAX_MS) interval_ms = AUTO_POLL_INTERVAL_MAX_MS;
+    slotConfig.auto_poll_interval_ms = interval_ms;
+    tag_emulation_save_config();
+    NRF_LOG_INFO("Auto-poll set: enable=0x%02X interval=%u ms", slotConfig.auto_poll_enable, slotConfig.auto_poll_interval_ms);
+}
+
+/**
+ * @brief Pick the best slot for a detected field of the given sense type.
+ *        Prefers the last slot a reader engaged (Smart poll memory); falls
+ *        back to the first slot enabled for that sense type.
+ * @return slot index, or TAG_MAX_SLOT_NUM if none is enabled for that sense.
+ */
+static uint8_t tag_emulation_pick_slot_for_sense(tag_sense_type_t sense) {
+    uint8_t pref = slotConfig.last_auth_slot;
+    if (pref < TAG_MAX_SLOT_NUM && is_slot_enabled(pref, sense)) {
+        return pref;
+    }
+    for (uint8_t i = 0; i < TAG_MAX_SLOT_NUM; i++) {
+        if (is_slot_enabled(i, sense)) {
+            return i;
+        }
+    }
+    return TAG_MAX_SLOT_NUM;  // no enabled slot for this sense type
+}
+
+/**
+ * @brief Called (from the HF/LF field-detect interrupt) when a reader field
+ *        is detected. If Smart poll is enabled, switches the active slot to the
+ *        best match for the field type and marks last_auth for persistence.
+ *
+ * ISR-SAFETY: this function performs NO Flash/FDS writes. The slot switch here
+ * is a pure RAM + sense-toggle operation (flash reads in tag_emulation_load_data
+ * are memory-mapped and safe from interrupt context). The last_auth persistence
+ * is deferred to tag_emulation_smart_poll_process(), which runs in the main
+ * loop, so the FDS write never happens inside the interrupt.
+ */
+void tag_emulation_smart_poll_on_field(tag_sense_type_t sense) {
+    // Remember which field type woke us — auto-poll rotation uses this to stay
+    // within the same band (HF reader polls only HF slots, LF only LF slots).
+    g_active_sense = sense;
+
+    // ---- Manual (key-selected) mode -------------------------------------
+    // The user picked a slot with A/B; present THAT slot to the reader and
+    // never auto-rotate. g_manual_slot_select is STICKY (set by cycle_slot /
+    // any A/B press) and is only cleared when multi-slot rotation is re-enabled
+    // in tag_emulation_set_auto_poll(), so a reader field blip can't silently
+    // drop us back into cycling from slot 1.
+    if (g_manual_slot_select) {
+        return;
+    }
+
+    bool rotate = (slotConfig.auto_poll_enable & AUTO_POLL_TIMER_ROTATE) != 0;
+
+    if (rotate) {
+        if (!g_ap_cycling) {
+            // Begin a fresh auto-poll cycle, starting from the best slot for
+            // this sense type (last reader slot, else first enabled).
+            uint8_t sel = tag_emulation_pick_slot_for_sense(sense);
+            if (sel < TAG_MAX_SLOT_NUM) {
+                if (sel != slotConfig.active_slot) {
+                    tag_emulation_set_slot(sel);
+                    tag_emulation_load_data();
+                }
+                if (slotConfig.last_auth_slot != sel) {
+                    slotConfig.last_auth_slot = sel;
+                    g_smart_poll_dirty = true;
+                }
+                NRF_LOG_INFO("Auto poll: field=%s -> start cycle at slot %d",
+                             sense == TAG_SENSE_HF ? "HF" : "LF", sel);
+            }
+            g_ap_cycling = true;
+        }
+        // KEY FIX: a field re-assert (blip) must NOT reset us to the first slot.
+        // Just refresh the time guard and keep cycling from the current slot,
+        // so the reader is offered 1,2,3,4 in turn instead of looping on slot 1.
+        g_ap_cycle_end_ticks =
+            app_timer_cnt_get() + APP_TIMER_TICKS(AUTO_POLL_CYCLE_GUARD_MS);
+        return;
+    }
+
+    // ---- No timer-rotate: ordinary Smart-select -------------------------
+    // Field wakeup simply selects the best slot; no multi-slot cycle.
+    if (!(slotConfig.auto_poll_enable & AUTO_POLL_SMART_SELECT)) {
+        return;
+    }
+    uint8_t sel = tag_emulation_pick_slot_for_sense(sense);
+    if (sel >= TAG_MAX_SLOT_NUM) {
+        return;  // nothing enabled for this field type
+    }
+    if (sel != slotConfig.active_slot) {
+        // Only switch the active slot and reload its emulated data into RAM.
+        // Do NOT call sense_end()/sense_run() here: the field-detect ISR that
+        // invoked us is about to start emulation itself (the HF callback
+        // re-inits NFC, the LF handler plays the PWM burst). Toggling sense
+        // inside the ISR corrupts the LF modulation state and breaks LF
+        // emulation. The caller's emulation start will transmit the freshly
+        // loaded data for the new slot. No FDS write happens here.
+        tag_emulation_set_slot(sel);
+        tag_emulation_load_data();
+        NRF_LOG_INFO("Smart poll: field=%s -> slot %d",
+                     sense == TAG_SENSE_HF ? "HF" : "LF", sel);
+    }
+    // remember which slot the reader just engaged (persisted in main loop)
+    if (slotConfig.last_auth_slot != sel) {
+        slotConfig.last_auth_slot = sel;
+        g_smart_poll_dirty = true;
+    }
+}
+
+void tag_emulation_user_select_slot(void) {
+    // The user explicitly chose a slot via A/B: take manual control and cancel
+    // any running auto-poll cycle.
+    g_manual_slot_select = true;
+    g_ap_cycling = false;
+}
+
+void tag_emulation_on_field_lost(void) {
+    // Manual (key-selected) mode is STICKY: a field blip or a full read-drop
+    // must NOT cancel it, otherwise the reader's routine field toggles would
+    // immediately drop us back into auto-poll cycling from slot 1. The user
+    // leaves manual mode only by re-enabling multi-slot rotation (see
+    // tag_emulation_set_auto_poll). The cycle session's own time guard keeps
+    // it alive across blips, so there is nothing to tear down here.
+}
+
+/**
+ * @brief Main-loop counterpart of tag_emulation_smart_poll_on_field().
+ *        Persists the last_auth_slot update to Flash. MUST be called from the
+ *        main loop, never from interrupt context.
+ */
+void tag_emulation_smart_poll_process(void) {
+    if (g_smart_poll_dirty) {
+        g_smart_poll_dirty = false;
+        tag_emulation_save_config();
+        NRF_LOG_INFO("Smart poll: persisted last_auth_slot=%d", slotConfig.last_auth_slot);
+    }
+}
+
+/**
+ * @brief Timer-driven multi-slot auto polling. Rotates the active slot among
+ *        the card slots enabled for the SENSE of the field that woke the device.
+ *        Gated on the auto-poll CYCLE SESSION (started and time-guarded in
+ *        tag_emulation_smart_poll_on_field()), NOT on the momentary field flag
+ *        g_is_tag_emulating. This way a field blip mid-poll does not freeze
+ *        rotation, and the cycle keeps offering 1,2,3,4 in turn until its time
+ *        guard expires.
+ */
+void tag_emulation_auto_poll_rotate(void) {
+    if (!(slotConfig.auto_poll_enable & AUTO_POLL_TIMER_ROTATE)) {
+        return;
+    }
+    if (get_device_mode() != DEVICE_MODE_TAG) {
+        return;
+    }
+    // Cycle session gating (set by passive RF wake, not by a button press).
+    if (!g_ap_cycling) {
+        return;
+    }
+    // Time guard: once no field has re-asserted for AUTO_POLL_CYCLE_GUARD_MS,
+    // end the cycle so we stop rotating.
+    if (app_timer_cnt_diff_compute(g_ap_cycle_end_ticks, app_timer_cnt_get()) <= 0) {
+        g_ap_cycling = false;
+        NRF_LOG_INFO("Auto poll: cycle guard expired, stop");
+        return;
+    }
+    uint8_t next = tag_emulation_slot_find_next(slotConfig.active_slot);
+    if (next != slotConfig.active_slot) {
+        tag_emulation_change_slot(next, true);
+        NRF_LOG_INFO("Auto poll rotate -> slot %d", next);
     }
 }
 

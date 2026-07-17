@@ -3,6 +3,7 @@
 #include "bsp_delay.h"
 #include "usb_main.h"
 #include "rfid_main.h"
+#include "tag_emulation.h"   // auto-poll: tag_emulation_get/set_auto_poll, AUTO_POLL_*
 #include "ble_main.h"
 #include "syssleep.h"
 #include "hex_utils.h"
@@ -2970,6 +2971,31 @@ static data_frame_tx_t *cmd_processor_hf14a_4_debug_counters(uint16_t cmd, uint1
     return data_frame_make(cmd, STATUS_SUCCESS, 4, buf);
 }
 #endif
+static data_frame_tx_t *cmd_processor_get_auto_poll_config(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    uint8_t enable;
+    uint16_t interval_ms;
+    uint8_t last_auth;
+    tag_emulation_get_auto_poll(&enable, &interval_ms, &last_auth);
+    // payload: [enable:1][interval_ms_be16:2][last_auth_slot:1]
+    uint8_t payload[4];
+    payload[0] = enable;
+    payload[1] = (interval_ms >> 8) & 0xFF;
+    payload[2] = interval_ms & 0xFF;
+    payload[3] = last_auth;
+    return data_frame_make(cmd, STATUS_SUCCESS, sizeof(payload), payload);
+}
+
+static data_frame_tx_t *cmd_processor_set_auto_poll_config(uint16_t cmd, uint16_t status, uint16_t length, uint8_t *data) {
+    // payload: [enable:1][interval_ms_be16:2]
+    if (length != 3) {
+        return data_frame_make(cmd, STATUS_PAR_ERR, 0, NULL);
+    }
+    uint8_t enable = data[0] & (AUTO_POLL_SMART_SELECT | AUTO_POLL_TIMER_ROTATE);
+    uint16_t interval_ms = ((uint16_t)data[1] << 8) | data[2];
+    tag_emulation_set_auto_poll(enable, interval_ms);
+    return data_frame_make(cmd, STATUS_SUCCESS, 0, NULL);
+}
+
 static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_APP_VERSION,              NULL,                        cmd_processor_get_app_version,               NULL                   },
     {    DATA_CMD_CHANGE_DEVICE_MODE,           NULL,                        cmd_processor_change_device_mode,            NULL                   },
@@ -3011,6 +3037,8 @@ static cmd_data_map_t m_data_cmd_map[] = {
     {    DATA_CMD_GET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_get_sleep_timeout,             NULL                   },
     {    DATA_CMD_SET_SLEEP_TIMEOUT,            NULL,                        cmd_processor_set_sleep_timeout,             NULL                   },
     {    DATA_CMD_GET_ALL_SLOT_NICKS,           NULL,                        cmd_processor_get_all_slot_nicks,            NULL                   },
+    {    DATA_CMD_GET_AUTO_POLL_CONFIG,         NULL,                        cmd_processor_get_auto_poll_config,         NULL                   },
+    {    DATA_CMD_SET_AUTO_POLL_CONFIG,         NULL,                        cmd_processor_set_auto_poll_config,         NULL                   },
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
 

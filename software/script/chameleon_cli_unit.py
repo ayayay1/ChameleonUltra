@@ -889,6 +889,7 @@ lf_em = lf.subgroup("em", "EM commands")
 lf_em_4x05 = lf_em.subgroup("4x05", "EM4x05/EM4x69 commands")
 data = root.subgroup('data', 'Data analysis and visualization commands')
 emv = root.subgroup('emv', 'EMV contactless payment card commands')
+ap = root.subgroup('auto-poll', 'Smart poll / multi-slot auto polling config')
 
 
 lf_em_410x = lf_em.subgroup("410x", "EM410x commands")
@@ -1065,6 +1066,68 @@ class HWDisconnect(BaseCLIUnit):
 
     def on_exec(self, args: argparse.Namespace):
         self.device_com.close()
+
+
+@ap.command("get")
+class AutoPollGet(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Get Smart poll / auto-polling configuration"
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        resp = self.cmd.get_auto_poll_config()
+        if resp.status == Status.SUCCESS:
+            enable, interval, last_auth = resp.parsed
+            flags = []
+            if enable & 0x01:
+                flags.append("smart-select")
+            if enable & 0x02:
+                flags.append("timer-rotate")
+            flag_str = ",".join(flags) if flags else "disabled"
+            print(f"Auto-poll enabled : {flag_str} (0x{enable:02X})")
+            print(f"Rotate interval   : {interval} ms")
+            print(f"Last auth slot   : {last_auth}")
+        else:
+            print(color_string((CR, f"Failed: {resp.status}")))
+
+
+@ap.command("set")
+class AutoPollSet(DeviceRequiredUnit):
+    def args_parser(self) -> ArgumentParserNoExit:
+        parser = ArgumentParserNoExit()
+        parser.description = "Set Smart poll / auto-polling configuration"
+        parser.add_argument("--enable", action="store_true",
+                            help="Enable FULL auto-poll: wake-on-field + multi-slot rotation (recommended)")
+        parser.add_argument("--enable-smart", action="store_true",
+                            help="Enable only field-type-aware Smart poll (pick slot by HF/LF field + last used)")
+        parser.add_argument("--enable-rotate", action="store_true",
+                            help="Enable only timer-based multi-slot auto rotation")
+        parser.add_argument("--disable", action="store_true",
+                            help="Disable all auto-poll features")
+        parser.add_argument("-i", "--interval", type=int, default=1000,
+                            help="Rotation interval in ms (200-60000, default 1000)")
+        return parser
+
+    def on_exec(self, args: argparse.Namespace):
+        if args.disable:
+            enable = 0
+        else:
+            enable = 0
+            if args.enable:
+                enable = 0x01 | 0x02
+            if args.enable_smart:
+                enable |= 0x01
+            if args.enable_rotate:
+                enable |= 0x02
+            if enable == 0:
+                print(color_string((CY, "Specify --enable (full), --enable-smart and/or --enable-rotate, or --disable")))
+                return
+        resp = self.cmd.set_auto_poll_config(enable, args.interval)
+        if resp.status == Status.SUCCESS:
+            print(color_string((CG, "Auto-poll config updated")))
+        else:
+            print(color_string((CR, f"Failed: {resp.status}")))
 
 
 @hw.command("mode")

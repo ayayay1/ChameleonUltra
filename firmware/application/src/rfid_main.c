@@ -89,6 +89,16 @@ void light_up_by_slot(void) {
 }
 
 /**
+ * @brief Turn all slot LEDs off (used when auto-poll is idle / no field).
+ */
+void light_off_all(void) {
+    uint32_t *led_pins = hw_get_led_array();
+    for (int i = 0; i < RGB_LIST_NUM; i++) {
+        nrf_gpio_pin_clear(led_pins[i]);
+    }
+}
+
+/**
  * @brief Apply visual and state changes after switching slot
  */
 void apply_slot_change(uint8_t slot_now, uint8_t slot_new) {

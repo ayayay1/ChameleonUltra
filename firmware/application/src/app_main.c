@@ -7,6 +7,7 @@
 #include "nrf.h"
 
 #include "app_timer.h"
+#include "tag_emulation.h"   // auto-poll: tag_emulation_get_auto_poll / _rotate
 #include "app_usbd.h"
 #include "app_util_platform.h"
 #include "nrf_delay.h"
@@ -48,6 +49,7 @@ NRF_LOG_MODULE_REGISTER();
 
 // Defining soft timers
 APP_TIMER_DEF(m_button_check_timer); // Timer for button debounce
+APP_TIMER_DEF(m_auto_poll_timer);   // Timer for multi-slot auto polling rotation
 
 static uint32_t m_last_btn_press = 0;
 
@@ -92,8 +94,46 @@ void assert_nrf_callback(uint16_t line_num, const uint8_t *p_file_name) {
 
 /**@brief Function for initializing the timer module.
  */
+/**
+ * @brief Auto-poll rotation tick. Runs on a fixed 200 ms cadence; the
+ *        configured interval is enforced here so changes take effect without
+ *        re-creating the timer. The actual rotation is gated inside
+ *        tag_emulation_auto_poll_rotate() on the cycle session + time guard
+ *        (started by a passive RF wake in tag_emulation_smart_poll_on_field()).
+ *        With no active cycle (key wakeup / idle / manual slot) nothing rotates
+ *        and the LED stays on the selected slot.
+ */
+static uint32_t m_last_auto_poll_rotate = 0;
+static void auto_poll_timer_handler(void *p_context) {
+    uint8_t enable;
+    uint16_t interval_ms;
+    uint8_t last_auth;
+    tag_emulation_get_auto_poll(&enable, &interval_ms, &last_auth);
+    if (!(enable & AUTO_POLL_TIMER_ROTATE)) {
+        return;
+    }
+    if (get_device_mode() != DEVICE_MODE_TAG) {
+        return;
+    }
+    // Rotation is gated inside tag_emulation_auto_poll_rotate() on the cycle
+    // session + time guard (started by passive RF wake), not on the momentary
+    // field flag. So we simply enforce the interval here and let rotate decide.
+    uint32_t now = app_timer_cnt_get();
+    if (app_timer_cnt_diff_compute(now, m_last_auto_poll_rotate) < APP_TIMER_TICKS(interval_ms)) {
+        return;
+    }
+    m_last_auto_poll_rotate = now;
+    tag_emulation_auto_poll_rotate();
+}
+
 static void app_timers_init(void) {
     ret_code_t err_code = app_timer_init();
+    APP_ERROR_CHECK(err_code);
+
+    // Auto-poll rotation timer: fixed 200 ms tick, interval enforced in handler.
+    err_code = app_timer_create(&m_auto_poll_timer, APP_TIMER_MODE_REPEATED, auto_poll_timer_handler);
+    APP_ERROR_CHECK(err_code);
+    err_code = app_timer_start(m_auto_poll_timer, APP_TIMER_TICKS(200), NULL);
     APP_ERROR_CHECK(err_code);
 }
 
@@ -193,6 +233,10 @@ static void button_pin_handler(nrf_drv_gpiote_pin_t pin, nrf_gpiote_polarity_t a
     }
 }
 
+/** @brief Hardware rescue combos (declared here, defined below the handler) */
+static void combo_reset(void);
+static void combo_enter_dfu(void);
+
 /** @brief Button anti-shake timer
  * @param None
  * @return None
@@ -207,22 +251,20 @@ static void timer_button_event_handle(void *arg) {
 
     nrf_drv_gpiote_pin_t pin = *(nrf_drv_gpiote_pin_t *)arg;
 
-    // Check here if the current GPIO is at the pressed level
+    // Track the held state of each button independently of its configured
+    // function, so the hardware rescue combos below always work even if a
+    // button's normal function has been disabled in settings.
+    //   BUTTON_1 == B button, BUTTON_2 == A button (per board wiring).
     if (nrf_gpio_pin_read(pin) == 1) {
         if (pin == BUTTON_1) {
-            // If button is disabled, we can't dispatch key event.
-            if (settings_get_button_press_config('b') != SettingsButtonDisable) {
-                NRF_LOG_INFO("BUTTON_B_PRESS");
-                m_is_b_btn_press = true;
-                m_last_btn_press = app_timer_cnt_get();
-            }
+            NRF_LOG_INFO("BUTTON_B_PRESS");
+            m_is_b_btn_press = true;
+            m_last_btn_press = app_timer_cnt_get();
         }
         if (pin == BUTTON_2) {
-            if (settings_get_button_press_config('a') != SettingsButtonDisable) {
-                NRF_LOG_INFO("BUTTON_A_PRESS");
-                m_is_a_btn_press = true;
-                m_last_btn_press = app_timer_cnt_get();
-            }
+            NRF_LOG_INFO("BUTTON_A_PRESS");
+            m_is_a_btn_press = true;
+            m_last_btn_press = app_timer_cnt_get();
         }
     }
 
@@ -232,31 +274,67 @@ static void timer_button_event_handle(void *arg) {
 
         bool is_long_press = ticks > APP_TIMER_TICKS(1000);
 
+        // ---- Hardware rescue combos (independent of button function config) ----
+        // A->B : hold A, then tap B  -> soft Reset (reboot into application)
+        // B->A : hold B, then tap A  -> enter DFU bootloader
         if (pin == BUTTON_1 && m_is_b_btn_press == true) {
-            // If button is disabled, we can't dispatch key event.
+            m_is_b_btn_press = false;
+            if (m_is_a_btn_press) {
+                // A is still held while B was tapped -> combo A->B = Reset
+                combo_reset();
+                return;
+            }
             if (settings_get_button_press_config('b') != SettingsButtonDisable) {
                 m_is_b_btn_release = true;
-                m_is_b_btn_press = false;
-                if (!is_long_press) {
-                    NRF_LOG_INFO("BUTTON_B_RELEASE_SHORT");
-                } else {
-                    NRF_LOG_INFO("BUTTON_B_RELEASE_LONG");
-                }
                 m_is_btn_long_press = is_long_press;
+                NRF_LOG_INFO(is_long_press ? "BUTTON_B_RELEASE_LONG" : "BUTTON_B_RELEASE_SHORT");
             }
         }
         if (pin == BUTTON_2 && m_is_a_btn_press == true) {
+            m_is_a_btn_press = false;
+            if (m_is_b_btn_press) {
+                // B is still held while A was tapped -> combo B->A = Enter DFU
+                combo_enter_dfu();
+                return;
+            }
             if (settings_get_button_press_config('a') != SettingsButtonDisable) {
                 m_is_a_btn_release = true;
-                m_is_a_btn_press = false;
-                if (!is_long_press) {
-                    NRF_LOG_INFO("BUTTON_A_RELEASE_SHORT");
-                } else {
-                    NRF_LOG_INFO("BUTTON_A_RELEASE_LONG");
-                }
                 m_is_btn_long_press = is_long_press;
+                NRF_LOG_INFO(is_long_press ? "BUTTON_A_RELEASE_LONG" : "BUTTON_A_RELEASE_SHORT");
             }
         }
+    }
+}
+
+/**@brief Combo A->B: soft reset (reboot into the application).
+ */
+static void combo_reset(void) {
+    NRF_LOG_WARNING("Combo A->B: soft reset");
+    // Persist any pending Smart-poll / slot state before rebooting.
+    tag_emulation_save();
+    while (NRF_LOG_PROCESS());
+    ret_code_t ret = sd_nvic_SystemReset();
+    APP_ERROR_CHECK(ret);
+    while (1) {
+        __NOP();
+    }
+}
+
+/**@brief Combo B->A: reboot into the DFU bootloader for OTA flashing.
+ */
+static void combo_enter_dfu(void) {
+    NRF_LOG_WARNING("Combo B->A: enter DFU");
+    // Persist any pending Smart-poll / slot state before leaving the app.
+    tag_emulation_save();
+    while (NRF_LOG_PROCESS());
+#define BOOTLOADER_DFU_GPREGRET_MASK            (0xB0)
+#define BOOTLOADER_DFU_START_BIT_MASK           (0x01)
+#define BOOTLOADER_DFU_START    (BOOTLOADER_DFU_GPREGRET_MASK |         BOOTLOADER_DFU_START_BIT_MASK)
+    APP_ERROR_CHECK(sd_power_gpregret_clr(0, 0xffffffff));
+    APP_ERROR_CHECK(sd_power_gpregret_set(0, BOOTLOADER_DFU_START));
+    nrf_pwr_mgmt_shutdown(NRF_PWR_MGMT_SHUTDOWN_GOTO_DFU);
+    while (1) {
+        __NOP();
     }
 }
 
@@ -574,6 +652,10 @@ static void check_wakeup_src(void) {
 /**@brief change slot
  */
 static void cycle_slot(bool dec) {
+    // A button press explicitly selects a slot (key-wakeup / manual mode):
+    // take manual control and cancel any running auto-poll cycle, so a
+    // following reader field emulates THIS slot instead of cycling.
+    tag_emulation_user_select_slot();
     // In any case, a button event occurs and we need to get the currently active card slot first
     uint8_t slot_now = tag_emulation_get_slot();
     uint8_t slot_new = slot_now;
@@ -951,6 +1033,33 @@ static void blink_usb_led_status(void) {
     uint8_t color = get_color_by_slot(slot);
     uint8_t dir = slot > 3 ? 1 : 0;
     static bool is_working = false;
+
+    // Auto-poll rotation: while multi-slot rotation is enabled, show ONLY the
+    // LED of the slot currently being polled (in its slot color) and never run
+    // any RGB marquee (idle rainbow / sweep). This keeps a clean "which slot is
+    // being polled" indication instead of lighting up all LEDs. Works whether
+    // on USB or on battery. See tag_emulation_auto_poll_rotate().
+    {
+        uint8_t ap_enable;
+        uint16_t ap_interval;
+        uint8_t ap_last;
+        tag_emulation_get_auto_poll(&ap_enable, &ap_interval, &ap_last);
+        if (ap_enable & AUTO_POLL_TIMER_ROTATE) {
+            // Auto-poll mode: the slot LED stays CONSTANT on the active slot.
+            // It does NOT run any RGB marquee, and it does NOT go dark when the
+            // device is idle (key-wakeup, no reader field present). The rotation
+            // between slots is gated on a reader field in
+            // tag_emulation_auto_poll_rotate() ("passive RF wakeup triggers
+            // polling"); the LED itself is always lit on the current slot,
+            // whether the device was woken by a key or by a field. Switching
+            // slots just moves the constantly-lit LED, it never turns it off.
+            rgb_marquee_stop();
+            set_slot_light_color(color);
+            light_up_by_slot();
+            return;
+        }
+    }
+
     if (nrfx_power_usbstatus_get() == NRFX_POWER_USB_STATE_DISCONNECTED) {
         if (is_working) {
             rgb_marquee_stop();
@@ -1040,6 +1149,8 @@ int main(void) {
         lesc_event_process();
         // Button event process
         button_press_process();
+        // Persist Smart-poll last_auth update (deferred from the field ISR)
+        tag_emulation_smart_poll_process();
 
 #if defined(PROJECT_CHAMELEON_ULTRA)
         // Field generator rainbow animation

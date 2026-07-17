@@ -6,9 +6,9 @@
 #    You can ignore this file modify.
 # Warning: your toolchain path not allow PR to public repo!!!
 # If you need define the toolchain path, plz delete annotate and change it.
-#GNU_INSTALL_ROOT ?= /your/toolchain/path/
-#GNU_VERSION ?= 8.8.8
-#GNU_PREFIX ?= arm-none-eabi
+GNU_INSTALL_ROOT ?= /Users/gaochengtai/gcc-arm-none-eabi-10.3-2021.10/bin/
+GNU_VERSION ?= 10.3.1
+GNU_PREFIX ?= arm-none-eabi
 
 
 PROJECT_NAME     := chameleon_ultra_firmware
@@ -26,7 +26,9 @@ CHAMELEON_LITE  := lite
 CURRENT_DEVICE_TYPE ?= ${CHAMELEON_ULTRA}
 
 # Versioning information
-GIT_VERSION := $(shell git describe --abbrev=7 --dirty --always --tags --match "v*.*")
+# GIT_VERSION overridden to custom build label (DAHAOREN build).
+GIT_VERSION := 2.2.0-DAHAOREN
+# GIT_VERSION := $(shell git describe --abbrev=7 --dirty --always --tags --match "v*.*")
 APP_FW_SEMVER := $(subst v,,$(shell git describe --tags --abbrev=0 --match "v*.*"))
 APP_FW_VER_MAJOR := $(word 1,$(subst ., ,$(APP_FW_SEMVER)))
 APP_FW_VER_MINOR := $(word 2,$(subst ., ,$(APP_FW_SEMVER)))

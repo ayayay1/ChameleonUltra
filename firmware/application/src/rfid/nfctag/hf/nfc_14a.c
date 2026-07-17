@@ -652,6 +652,9 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
             g_is_tag_emulating = true;
             g_usb_led_marquee_enable = false;
 
+            // Smart poll: select the best slot for this HF field before answering
+            tag_emulation_smart_poll_on_field(TAG_SENSE_HF);
+
             set_slot_light_color(RGB_GREEN);
             TAG_FIELD_LED_ON()
 
@@ -673,6 +676,7 @@ void nfc_tag_14a_event_callback(nrfx_nfct_evt_t const *p_event) {
         }
         case NRFX_NFCT_EVT_FIELD_LOST: {
             g_is_tag_emulating = false;
+            tag_emulation_on_field_lost();
             // call sleep_timer_start *after* unsetting g_is_tag_emulating
             sleep_timer_start(SLEEP_DELAY_MS_FIELD_NFC_LOST);
 

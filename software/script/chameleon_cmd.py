@@ -1550,6 +1550,30 @@ class ChameleonCMD:
         return self.device.send_cmd_sync(Command.SET_SLEEP_TIMEOUT, data)
 
     @expect_response(Status.SUCCESS)
+    def get_auto_poll_config(self):
+        """
+        Get Smart poll / auto-polling config.
+        Returns parsed tuple: (enable:int, interval_ms:int, last_auth_slot:int)
+        """
+        resp = self.device.send_cmd_sync(Command.GET_AUTO_POLL_CONFIG)
+        if resp.status == Status.SUCCESS and len(resp.data) >= 4:
+            enable = resp.data[0]
+            interval_ms = struct.unpack('!H', resp.data[1:3])[0]
+            last_auth_slot = resp.data[3]
+            resp.parsed = (enable, interval_ms, last_auth_slot)
+        return resp
+
+    @expect_response(Status.SUCCESS)
+    def set_auto_poll_config(self, enable: int, interval_ms: int):
+        """
+        Set Smart poll / auto-polling config.
+        :param enable: bit0=smart-select, bit1=timer-rotate
+        :param interval_ms: rotation interval in ms (clamped 200-60000 on device)
+        """
+        data = struct.pack('!B', enable & 0x03) + struct.pack('!H', interval_ms & 0xFFFF)
+        return self.device.send_cmd_sync(Command.SET_AUTO_POLL_CONFIG, data)
+
+    @expect_response(Status.SUCCESS)
     def reset_settings(self):
         """
         Reset settings stored in flash memory

@@ -42,6 +42,7 @@ const nrf_pwm_sequence_t *m_pwm_seq = NULL;
 static void lf_field_lost(void) {
     // Open the incident interruption, so that the next event can be in and out normally
     g_is_tag_emulating = false;  // Reset the flag in the emulation
+    tag_emulation_on_field_lost();
     m_is_lf_emulating = false;
     TAG_FIELD_LED_OFF()  // Make sure the indicator light of the LF field status
     // Re-arm LPCOMP so the next field appearance triggers lpcomp_event_handler.
@@ -86,6 +87,9 @@ static void lpcomp_event_handler(nrf_lpcomp_event_t event) {
     g_is_tag_emulating = true;
     // turn off USB light effect when emulating cards
     g_usb_led_marquee_enable = false;
+
+    // Smart poll: select the best slot for this LF field before answering
+    tag_emulation_smart_poll_on_field(TAG_SENSE_LF);
 
     // LED status update
     set_slot_light_color(RGB_BLUE);
