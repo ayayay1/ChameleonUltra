@@ -111,6 +111,8 @@ static tag_slot_config_t slotConfig ALIGN_U32 = {
     .auto_poll_enable = AUTO_POLL_ALL,
     .last_auth_slot = 0,
     .auto_poll_interval_ms = AUTO_POLL_INTERVAL_DEFAULT_MS,
+    .last_auth_hf = 0,
+    .last_auth_lf = 0,
 };
 // The card slot configuration unique CRC, once the slot configuration changes, can be checked by CRC
 static uint16_t m_slot_config_crc;
@@ -534,6 +536,18 @@ static void tag_emulation_migrate_slot_config_v10_to_v11(void) {
     slotConfig.auto_poll_interval_ms = AUTO_POLL_INTERVAL_DEFAULT_MS;
 }
 
+static void tag_emulation_migrate_slot_config_v11_to_v12(void) {
+    // v12: split the previously shared last_auth_slot into per-sense
+    // last_auth_hf / last_auth_lf so an HF wake and an LF wake each resume the
+    // auto-poll cycle from the slot that band last engaged (the shared slot
+    // could point at the other band and bias the start wrongly, e.g. an LF wake
+    // from the default slot 3 never reaching slot 1).
+    NRF_LOG_INFO("Migrating slotConfig v11 -> v12 (per-sense last_auth)...");
+    slotConfig.version = 12;
+    slotConfig.last_auth_hf = slotConfig.last_auth_slot;
+    slotConfig.last_auth_lf = slotConfig.last_auth_slot;
+}
+
 static void tag_emulation_migrate_slot_config(void) {
     switch (slotConfig.version) {
         case 0:
@@ -561,6 +575,9 @@ static void tag_emulation_migrate_slot_config(void) {
             // fall through
         case 10:
             tag_emulation_migrate_slot_config_v10_to_v11();
+            // fall through
+        case 11:
+            tag_emulation_migrate_slot_config_v11_to_v12();
             tag_emulation_save_config();
         case TAG_SLOT_CONFIG_CURRENT_VERSION:
             break;
@@ -799,7 +816,12 @@ void tag_emulation_set_auto_poll(uint8_t enable, uint16_t interval_ms) {
  * @return slot index, or TAG_MAX_SLOT_NUM if none is enabled for that sense.
  */
 static uint8_t tag_emulation_pick_slot_for_sense(tag_sense_type_t sense) {
-    uint8_t pref = slotConfig.last_auth_slot;
+    // Per-sense last-auth: an HF wake and an LF wake each resume from the slot
+    // that band last engaged (the shared last_auth_slot could point at the
+    // other band and wrongly bias the cycle start, e.g. an LF wake from the
+    // default slot 3 never reaching slot 1).
+    uint8_t pref = (sense == TAG_SENSE_LF) ? slotConfig.last_auth_lf
+                                          : slotConfig.last_auth_hf;
     if (pref < TAG_MAX_SLOT_NUM && is_slot_enabled(pref, sense)) {
         return pref;
     }
@@ -849,8 +871,11 @@ void tag_emulation_smart_poll_on_field(tag_sense_type_t sense) {
                     tag_emulation_set_slot(sel);
                     tag_emulation_load_data();
                 }
-                if (slotConfig.last_auth_slot != sel) {
-                    slotConfig.last_auth_slot = sel;
+                if (((sense == TAG_SENSE_LF) ? slotConfig.last_auth_lf
+                                            : slotConfig.last_auth_hf) != sel) {
+                    if (sense == TAG_SENSE_LF) slotConfig.last_auth_lf = sel;
+                    else                       slotConfig.last_auth_hf = sel;
+                    slotConfig.last_auth_slot = sel;   // CLI/compat
                     g_smart_poll_dirty = true;
                 }
                 NRF_LOG_INFO("Auto poll: field=%s -> start cycle at slot %d",
@@ -889,8 +914,11 @@ void tag_emulation_smart_poll_on_field(tag_sense_type_t sense) {
                      sense == TAG_SENSE_HF ? "HF" : "LF", sel);
     }
     // remember which slot the reader just engaged (persisted in main loop)
-    if (slotConfig.last_auth_slot != sel) {
-        slotConfig.last_auth_slot = sel;
+    if (((sense == TAG_SENSE_LF) ? slotConfig.last_auth_lf
+                                : slotConfig.last_auth_hf) != sel) {
+        if (sense == TAG_SENSE_LF) slotConfig.last_auth_lf = sel;
+        else                       slotConfig.last_auth_hf = sel;
+        slotConfig.last_auth_slot = sel;   // CLI/compat
         g_smart_poll_dirty = true;
     }
 }
@@ -953,7 +981,26 @@ void tag_emulation_auto_poll_rotate(void) {
     }
     uint8_t next = tag_emulation_slot_find_next(slotConfig.active_slot);
     if (next != slotConfig.active_slot) {
-        tag_emulation_change_slot(next, true);
+        if (g_active_sense == TAG_SENSE_LF) {
+            // LF lightweight slot swap. The LF field is a continuous 125 kHz
+            // carrier; the running pwm_handler EVT_STOPPED replay loop re-reads
+            // the global m_pwm_seq on every field-confirmed burst, so we only
+            // need to rebuild that sequence for the new slot. This avoids the
+            // full teardown/re-init that tag_emulation_change_slot(..., true)
+            // performs (nrfx_pwm_uninit + nrfx_lpcomp_uninit + HFXO release and
+            // a blocking re-request), which could miss the narrow field window
+            // and leave the rotated LF slot unplayed -- the bug where an LF wake
+            // from the default slot 3 never reached slot 1.
+            tag_emulation_set_slot(next);
+            tag_emulation_load_data();   // rebuilds m_pwm_seq for the new slot
+            if (slotConfig.last_auth_lf != next) {
+                slotConfig.last_auth_lf = next;
+                slotConfig.last_auth_slot = next;   // CLI/compat
+                g_smart_poll_dirty = true;
+            }
+        } else {
+            tag_emulation_change_slot(next, true);
+        }
         NRF_LOG_INFO("Auto poll rotate -> slot %d", next);
     }
 }

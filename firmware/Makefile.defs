@@ -26,10 +26,18 @@ CHAMELEON_LITE  := lite
 CURRENT_DEVICE_TYPE ?= ${CHAMELEON_ULTRA}
 
 # Versioning information
-# GIT_VERSION overridden to custom build label (DAHAOREN build).
-GIT_VERSION := 2.2.0-DAHAOREN
+# DAHAOREN custom build label rule:
+#   GIT_VERSION = <upstream-semver>-DAHAOREN-<YYYYMMDD>-v<N>
+#   - base semver tracks the upstream release (currently v2.2.0)
+#   - date is the build date
+#   - N is bumped on each (re)build
+DAHAOREN_BUILD_DATE := $(shell date +%Y%m%d)
+GIT_VERSION := 2.2.0-DAHAOREN-$(DAHAOREN_BUILD_DATE)-v1
 # GIT_VERSION := $(shell git describe --abbrev=7 --dirty --always --tags --match "v*.*")
-APP_FW_SEMVER := $(subst v,,$(shell git describe --tags --abbrev=0 --match "v*.*"))
+# Base semver pinned to upstream v2.2.0. NOTE: this fork's main branch HEAD makes
+# `git describe --tags --abbrev=0` resolve to v1.0-base, so auto-detection yields the
+# wrong 1.0 version. Keep the semver explicit.
+APP_FW_SEMVER := 2.2.0
 APP_FW_VER_MAJOR := $(word 1,$(subst ., ,$(APP_FW_SEMVER)))
 APP_FW_VER_MINOR := $(word 2,$(subst ., ,$(APP_FW_SEMVER)))
 

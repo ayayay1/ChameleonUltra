@@ -49,9 +49,9 @@ typedef struct {
  * This configuration can be preserved by persistently to Flash
  * 4 bytes a word, keep in mind the entire word alignment
  */
-#define TAG_SLOT_CONFIG_CURRENT_VERSION 11
+#define TAG_SLOT_CONFIG_CURRENT_VERSION 12
 // Intended struct size, for static assert
-#define TAG_SLOT_CONFIG_CURRENT_SIZE 72
+#define TAG_SLOT_CONFIG_CURRENT_SIZE 76
 
 /* Auto-poll feature flags (bitmask stored in slotConfig.auto_poll_enable) */
 #define AUTO_POLL_SMART_SELECT  (1u << 0)  // pick slot by detected field type + last_auth
@@ -88,8 +88,10 @@ typedef struct {
     } slots[TAG_MAX_SLOT_NUM];
     // v9 additions: global auto-poll (Smart poll + multi-slot auto polling) settings
     uint8_t  auto_poll_enable;       // bitmask of AUTO_POLL_* flags
-    uint8_t  last_auth_slot;         // last slot a reader engaged (Smart poll preference)
+    uint8_t  last_auth_slot;         // last slot a reader engaged overall (kept for CLI/compat)
     uint16_t auto_poll_interval_ms;  // rotation interval for AUTO_POLL_TIMER_ROTATE
+    uint8_t  last_auth_hf;           // last slot an HF reader engaged (per-sense Smart poll preference)
+    uint8_t  last_auth_lf;           // last slot an LF reader engaged (per-sense Smart poll preference)
 } PACKED tag_slot_config_t;
 
 // Use the macro to check the struct size
