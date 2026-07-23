@@ -166,5 +166,12 @@ void tag_emulation_user_select_slot(void);
 // passive RF wake can auto-cycle again. The auto-poll cycle itself is left
 // running (time-guarded) so a field blip does not kill it.
 void tag_emulation_on_field_lost(void);
+// Called from lf_tag_em.c pwm_handler on NRFX_PWM_EVT_STOPPED (PWM fully
+// stopped) to apply a deferred LF slot rotation: rebuilds m_pwm_seq for the
+// slot the auto-poll timer selected. Never call while the PWM is playing.
+void tag_emulation_lf_apply_pending_slot(void);
+// Drops any pending deferred LF rotation (e.g. on field lost) so a stale
+// reload cannot overwrite the slot a fresh field-detect selects.
+void tag_emulation_lf_clear_pending_slot(void);
 
 #endif

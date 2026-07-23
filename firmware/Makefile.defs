@@ -32,7 +32,7 @@ CURRENT_DEVICE_TYPE ?= ${CHAMELEON_ULTRA}
 #   - date is the build date
 #   - N is bumped on each (re)build
 DAHAOREN_BUILD_DATE := $(shell date +%Y%m%d)
-GIT_VERSION := 2.2.0-DAHAOREN-$(DAHAOREN_BUILD_DATE)-v1
+GIT_VERSION := 2.2.0-DAHAOREN-$(DAHAOREN_BUILD_DATE)-v2
 # GIT_VERSION := $(shell git describe --abbrev=7 --dirty --always --tags --match "v*.*")
 # Base semver pinned to upstream v2.2.0. NOTE: this fork's main branch HEAD makes
 # `git describe --tags --abbrev=0` resolve to v1.0-base, so auto-detection yields the

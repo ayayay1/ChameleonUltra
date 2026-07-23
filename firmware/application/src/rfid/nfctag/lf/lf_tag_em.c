@@ -43,6 +43,7 @@ static void lf_field_lost(void) {
     // Open the incident interruption, so that the next event can be in and out normally
     g_is_tag_emulating = false;  // Reset the flag in the emulation
     tag_emulation_on_field_lost();
+    tag_emulation_lf_clear_pending_slot();  // drop any deferred LF rotation
     m_is_lf_emulating = false;
     TAG_FIELD_LED_OFF()  // Make sure the indicator light of the LF field status
     // Re-arm LPCOMP so the next field appearance triggers lpcomp_event_handler.
@@ -124,7 +125,10 @@ static void pwm_handler(nrfx_pwm_evt_type_t event_type) {
     ANT_NO_MOD();
     bsp_delay_ms(2);  // let peak detector drain: ~2 ms time constant on LF_RSSI
     if (is_lf_field_exists()) {
-        // Field still present — play another finite burst then check again.
+        // Field still present — apply any deferred LF slot rotation now (PWM is
+        // stopped at EVT_STOPPED, so rebuilding m_pwm_seq here is safe), then
+        // play another finite burst and check again.
+        tag_emulation_lf_apply_pending_slot();
         nrfx_pwm_simple_playback(&m_broadcast, m_pwm_seq, 10, NRFX_PWM_FLAG_STOP);
     } else {
         // Field gone — clean up.

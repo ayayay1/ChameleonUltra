@@ -59,6 +59,16 @@ static uint32_t g_ap_cycle_end_ticks = 0;
 // Cleared on FIELD_LOST so the next passive wake can auto-cycle again.
 static bool g_manual_slot_select = false;
 
+// When the auto-poll timer decides to rotate to a new LF slot, we must NOT
+// rebuild the PWM sequence (m_pwm_seq) from interrupt context while the LF
+// PWM is actively playing -- mutating the sequence under a running peripheral
+// corrupts the replay state machine (EVT_STOPPED may stop firing) and hangs
+// the device. Instead the timer only flips this flag + the active slot; the
+// actual data/sequence reload is deferred to lf_tag_em.c's pwm_handler
+// EVT_STOPPED, which is exactly when the PWM is fully stopped and safe to
+// re-point at a new sequence.
+static volatile bool g_lf_rotate_pending = false;
+
 static tag_specific_type_t tag_specific_type_old2new_lf_values[][2] = {TAG_SPECIFIC_TYPE_OLD2NEW_LF_VALUES};
 static tag_specific_type_t tag_specific_type_old2new_hf_values[][2] = {TAG_SPECIFIC_TYPE_OLD2NEW_HF_VALUES};
 static tag_specific_type_t tag_specific_type_lf_values[] = {TAG_SPECIFIC_TYPE_LF_VALUES};
@@ -991,8 +1001,15 @@ void tag_emulation_auto_poll_rotate(void) {
             // a blocking re-request), which could miss the narrow field window
             // and leave the rotated LF slot unplayed -- the bug where an LF wake
             // from the default slot 3 never reached slot 1.
-            tag_emulation_set_slot(next);
-            tag_emulation_load_data();   // rebuilds m_pwm_seq for the new slot
+            //
+            // IMPORTANT: we must NOT call tag_emulation_load_data() here (timer
+            // ISR, PWM still playing) -- rebuilding m_pwm_seq under a running
+            // PWM hangs the replay state machine (device freeze / WDT reset).
+            // We only update the slot index now and arm a deferred reload that
+            // pwm_handler() applies at the next EVT_STOPPED, where the PWM is
+            // guaranteed stopped and re-pointing the sequence is safe.
+            tag_emulation_set_slot(next);     // RAM-only; safe from ISR
+            g_lf_rotate_pending = true;       // reloaded at EVT_STOPPED
             if (slotConfig.last_auth_lf != next) {
                 slotConfig.last_auth_lf = next;
                 slotConfig.last_auth_slot = next;   // CLI/compat
@@ -1004,6 +1021,30 @@ void tag_emulation_auto_poll_rotate(void) {
         NRF_LOG_INFO("Auto poll rotate -> slot %d", next);
     }
 }
+
+/**
+ * @brief Apply a pending LF slot rotation. MUST be called from lf_tag_em.c's
+ *        pwm_handler on NRFX_PWM_EVT_STOPPED, i.e. when the PWM is fully
+ *        stopped and it is safe to rebuild the global m_pwm_seq. Rebuilding
+ *        the sequence from the auto-poll timer ISR (while the PWM plays) would
+ *        corrupt the replay state machine and freeze the device.
+ */
+void tag_emulation_lf_apply_pending_slot(void) {
+    if (g_lf_rotate_pending) {
+        g_lf_rotate_pending = false;
+        tag_emulation_load_data();   // PWM stopped here -> safe to rebuild seq
+    }
+}
+
+/**
+ * @brief Drop any pending LF rotation (e.g. when the field is lost). Prevents a
+ *        stale deferred reload from overwriting the slot a fresh field-detect
+ *        selects in tag_emulation_smart_poll_on_field().
+ */
+void tag_emulation_lf_clear_pending_slot(void) {
+    g_lf_rotate_pending = false;
+}
+
 
 /**
  * The factory initialization function of the card emulation.
